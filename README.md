@@ -1,14 +1,15 @@
+```
 /var/ossec/framework/python/bin/pip3 install iocextract
  sudo chown -R root:wazuh /var/ossec/framework/python/lib/python3.10/site-packages/
  sudo chmod -R u=rwX,g=rX,o= /var/ossec/framework/python/lib/python3.10/site-packages/
----
+
 <!-- misp it at your will.-->
  <integration>
   <name>custom-misp</name>
   <alert_format>json</alert_format>
   <level>3</level>
 </integration> 
----
+
 <!-- Modify it at your will. -->
 
 <group name="misp,">
@@ -35,3 +36,4 @@
     <group>misp_alert,</group>
 
 </group>
+```
