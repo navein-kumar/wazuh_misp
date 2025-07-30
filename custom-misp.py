@@ -6,13 +6,9 @@ import logging
 import requests
 from socket import socket, AF_UNIX, SOCK_DGRAM
 import urllib3
-from urllib.parse import urlparse
 import iocextract
 import re
-import time
-import pickle
 from logging.handlers import RotatingFileHandler
-from threading import Lock
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -24,11 +20,6 @@ MISP_BASE_URL = "https://cti.codesec.in/attributes/restSearch/"
 MISP_API_KEY = "wKanbzkcbKh1n4OzttPaw3d1qxv0IVWd5H3Ug3DO"
 MISP_SSL_VERIFY = False
 SOCKET_PATH = f"{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}" + "/queue/sockets/queue"
-
-# === CACHE CONFIG ===
-CACHE_FILE = "/var/ossec/logs/misp-cache.pkl"
-CACHE_DURATION = 3 * 60 * 60  # 3 hours in seconds
-cache_lock = Lock()
 
 # === LOG ROTATION CONFIG ===
 MAX_LOG_SIZE = 1024 * 1024 * 1024  # 1GB in bytes
@@ -67,130 +58,6 @@ MISP_HEADERS = {
     "Accept": "application/json"
 }
 
-# === SIMPLE IoC CACHE ===
-class Simple_IoC_Cache:
-    def __init__(self):
-        self.cache = {}
-        self.load_cache()
-    
-    def load_cache(self):
-        """Load cache from disk"""
-        try:
-            if os.path.exists(CACHE_FILE):
-                # Check if file is readable
-                if not os.access(CACHE_FILE, os.R_OK):
-                    logging.error(f"Cache file exists but not readable: {CACHE_FILE}")
-                    self.cache = {}
-                    return
-                
-                # Check file size
-                file_size = os.path.getsize(CACHE_FILE)
-                if file_size == 0:
-                    logging.warning(f"Cache file is empty: {CACHE_FILE}")
-                    self.cache = {}
-                    return
-                
-                with open(CACHE_FILE, 'rb') as f:
-                    self.cache = pickle.load(f)
-                    
-                logging.debug(f"Loaded {len(self.cache)} cached IoCs from {CACHE_FILE} ({file_size} bytes)")
-            else:
-                self.cache = {}
-                logging.info(f"No existing cache found at {CACHE_FILE}, starting fresh")
-                
-        except EOFError:
-            logging.error(f"Cache file corrupted (EOF): {CACHE_FILE}")
-            # Backup corrupted file and start fresh
-            try:
-                os.rename(CACHE_FILE, f"{CACHE_FILE}.corrupted.{int(time.time())}")
-                logging.info(f"Moved corrupted cache file to backup")
-            except:
-                pass
-            self.cache = {}
-        except Exception as e:
-            logging.error(f"Error loading cache from {CACHE_FILE}: {e}")
-            logging.error(f"Cache file permissions: {oct(os.stat(CACHE_FILE).st_mode)[-3:] if os.path.exists(CACHE_FILE) else 'N/A'}")
-            self.cache = {}
-    
-    def save_cache(self):
-        """Save cache to disk"""
-        try:
-            with cache_lock:
-                # Ensure directory exists
-                cache_dir = os.path.dirname(CACHE_FILE)
-                if not os.path.exists(cache_dir):
-                    os.makedirs(cache_dir, mode=0o755)
-                    logging.info(f"Created cache directory: {cache_dir}")
-                
-                # Write to temporary file first, then rename (atomic operation)
-                temp_file = CACHE_FILE + ".tmp"
-                with open(temp_file, 'wb') as f:
-                    pickle.dump(self.cache, f)
-                
-                # Atomic rename
-                os.rename(temp_file, CACHE_FILE)
-                
-                # Set proper permissions
-                os.chmod(CACHE_FILE, 0o644)
-                
-                logging.debug(f"Cache saved successfully to {CACHE_FILE}")
-                
-        except PermissionError as e:
-            logging.error(f"Permission error saving cache: {e}")
-            logging.error(f"Cache file location: {CACHE_FILE}")
-            logging.error(f"Current user: {os.getuid()}, group: {os.getgid()}")
-        except Exception as e:
-            logging.error(f"Error saving cache: {e}")
-            # Clean up temp file if it exists
-            temp_file = CACHE_FILE + ".tmp"
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-    
-    def cleanup_expired(self):
-        """Remove expired entries from cache"""
-        current_time = time.time()
-        expired_keys = []
-        
-        for ioc, data in self.cache.items():
-            if current_time - data['timestamp'] > CACHE_DURATION:
-                expired_keys.append(ioc)
-        
-        for key in expired_keys:
-            del self.cache[key]
-        
-        if expired_keys:
-            logging.info(f"Cleaned up {len(expired_keys)} expired cache entries")
-            self.save_cache()
-    
-    def get(self, ioc):
-        """Get IoC from cache if not expired"""
-        self.cleanup_expired()
-        
-        if ioc in self.cache:
-            data = self.cache[ioc]
-            if time.time() - data['timestamp'] <= CACHE_DURATION:
-                logging.info(f"Cache HIT for IoC: {ioc}")
-                return data['result']
-        
-        logging.debug(f"Cache MISS for IoC: {ioc}")
-        return None
-    
-    def set(self, ioc, result):
-        """Add IoC result to cache"""
-        with cache_lock:
-            self.cache[ioc] = {
-                'timestamp': time.time(),
-                'result': result
-            }
-            self.save_cache()
-        logging.debug(f"Cached result for IoC: {ioc}")
-
-# Initialize global cache
-ioc_cache = Simple_IoC_Cache()
-
 # === ENHANCED FILTERING PATTERNS ===
 IGNORED_IOC_PATTERNS = [
     r"^\d{1,4}$",  # Simple numbers
@@ -224,6 +91,8 @@ IGNORED_EXACT_IOCS = [
     "127.0.0.1",
     "0.0.0.0",
     "localhost",
+    "134.0.0.0",
+    "169.254.169.254",
 ]
 
 def setup_log_rotation(log_file):
@@ -331,34 +200,32 @@ def send_event(alert_data, agent=None):
         logging.error(f"send_event error: {e}")
 
 def search_misp(ioc):
-    """Search MISP for IoC with simple caching"""
-    # Check cache first
-    cached_result = ioc_cache.get(ioc)
-    if cached_result is not None:
-        logging.info(f"Using cached result for IoC: {ioc}")
-        return cached_result
-    
-    # Not in cache, make API call
+    """Search MISP for IoC - process all responses"""
     try:
         url = f"{MISP_BASE_URL}value:{ioc}"
-        response = requests.get(url, headers=MISP_HEADERS, verify=MISP_SSL_VERIFY, timeout=10)
+        response = requests.get(url, headers=MISP_HEADERS, verify=MISP_SSL_VERIFY, timeout=30)
         response.raise_for_status()
-        result = response.json()
         
-        # Cache the result
-        ioc_cache.set(ioc, result)
-        logging.info(f"MISP API call made and cached for IoC: {ioc}")
+        # Log response size for monitoring
+        content_length = response.headers.get('content-length')
+        if content_length:
+            size_mb = int(content_length) / (1024 * 1024)
+            logging.info(f"MISP response size: {size_mb:.1f}MB for IoC: {ioc}")
+        
+        # Process ALL responses regardless of size
+        result = response.json()
+        logging.info(f"MISP API call completed for IoC: {ioc}")
         return result
         
+    except requests.exceptions.Timeout:
+        logging.error(f"MISP API timeout (30s) for IoC: {ioc}")
+        return {"misp": {"error": "timeout"}}
     except requests.exceptions.RequestException as e:
-        error_result = {"misp": {"error": str(e), "status_code": getattr(e.response, 'status_code', 'N/A')}}
         logging.error(f"MISP API request error for {ioc}: {e}")
-        # Don't cache errors
-        return error_result
+        return {"misp": {"error": str(e), "status_code": getattr(e.response, 'status_code', 'N/A')}}
     except Exception as e:
-        error_result = {"misp": {"error": str(e)}}
         logging.error(f"MISP search error for {ioc}: {e}")
-        return error_result
+        return {"misp": {"error": str(e)}}
 
 def extract_and_filter_iocs(text):
     """Enhanced IoC extraction with comprehensive filtering"""
@@ -404,6 +271,11 @@ def extract_and_filter_iocs(text):
                 continue
         except Exception as e:
             logging.debug(f"Error checking IP {ioc}: {e}")
+
+        # Filter network addresses (XXX.0.0.0 pattern)
+        if re.match(r"^\d{1,3}\.0\.0\.0$", ioc):
+            logging.debug(f"Filtered (network address): {ioc}")
+            continue
 
         # Additional filtering for short digit strings
         if ioc.isdigit() and len(ioc) < 5:
@@ -475,7 +347,7 @@ def build_alert(misp_attr, alert):
     return data
 
 def main():
-    """Main function - simple sequential processing with cache"""
+    """Main function - simple processing without cache"""
     if len(sys.argv) < 2:
         logging.error("Missing alert file path.")
         sys.exit(1)
@@ -505,18 +377,12 @@ def main():
         logging.debug("No valid alerts to process")
         sys.exit(0)
 
-    # Only load cache when we have real alerts to process
-    if not hasattr(ioc_cache, 'cache_loaded'):
-        ioc_cache.cleanup_expired()
-        ioc_cache.cache_loaded = True
-        logging.debug(f"Cache initialized with {len(ioc_cache.cache)} cached IoCs")
-
     for alert in alerts:
         try:
             agent = safe_get(alert, "agent", {})
             text_blob = json.dumps(alert, default=str)
 
-            # Use the enhanced filtered extraction function
+            # Extract and filter IoCs
             iocs = extract_and_filter_iocs(text_blob)
 
             # Log extracted IoCs only if some are found
@@ -525,33 +391,47 @@ def main():
                 setup_log_rotation(LOG_IOCS_FILE)
                 
                 with open(LOG_IOCS_FILE, "a") as f_iocs:
-                    f_iocs.write(f'{json.dumps({"Extracted IoCs": iocs, "alert_id": safe_get(alert, "id", None), "timestamp": time.time()})}\n')
+                    f_iocs.write(f'{json.dumps({"Extracted IoCs": iocs, "alert_id": safe_get(alert, "id", None)})}\n')
                 logging.info(f"Extracted {len(iocs)} IoCs from alert {safe_get(alert, 'id', 'unknown')}: {iocs}")
             else:
-                # Only log if DEBUG level - most alerts have no valid IoCs
                 logging.debug(f"No valid IoCs found in alert {safe_get(alert, 'id', 'unknown')}")
 
-            # Search MISP for each IoC (one by one, with cache)
+            # Search MISP for each IoC (simple one by one)
             for ioc in iocs:
                 try:
                     resp = search_misp(ioc)
-                    attrs = resp.get("response", {}).get("Attribute", [])
                     
-                    if attrs:
-                        # IoC found in MISP - create alert
-                        alert_data = build_alert(attrs[0], alert)
-                        send_event(alert_data, agent)
+                    # Handle MISP response safely
+                    if isinstance(resp, dict) and "response" in resp:
+                        attrs = resp.get("response", {}).get("Attribute", [])
                         
-                        # Check log rotation before writing
-                        setup_log_rotation(LOG_ALERTS_FILE)
-                        
-                        # Log the MISP match
-                        with open(LOG_ALERTS_FILE, "a") as f_alerts:
-                            f_alerts.write(f'{json.dumps(alert_data)}\n')
-                        
-                        logging.warning(f"MISP match found for IoC: {ioc} in event {attrs[0].get('event_id', 'unknown')}")
+                        # Ensure attrs is a list and has items
+                        if attrs and isinstance(attrs, list) and len(attrs) > 0:
+                            # Use first attribute for alert
+                            first_attr = attrs[0]
+                            if isinstance(first_attr, dict):
+                                # IoC found in MISP - create alert
+                                alert_data = build_alert(first_attr, alert)
+                                send_event(alert_data, agent)
+                                
+                                # Check log rotation before writing
+                                setup_log_rotation(LOG_ALERTS_FILE)
+                                
+                                # Log the MISP match
+                                with open(LOG_ALERTS_FILE, "a") as f_alerts:
+                                    f_alerts.write(f'{json.dumps(alert_data)}\n')
+                                
+                                logging.warning(f"MISP match found for IoC: {ioc} in event {first_attr.get('event_id', 'unknown')}")
+                            else:
+                                logging.debug(f"Invalid attribute format for IoC: {ioc}")
+                        else:
+                            logging.debug(f"No MISP match found for IoC: {ioc}")
                     else:
-                        logging.debug(f"No MISP match found for IoC: {ioc}")
+                        # Handle error responses
+                        if isinstance(resp, dict) and "misp" in resp and "error" in resp["misp"]:
+                            logging.debug(f"MISP error for IoC {ioc}: {resp['misp']['error']}")
+                        else:
+                            logging.debug(f"Unexpected MISP response format for IoC: {ioc}")
                         
                 except Exception as e:
                     logging.error(f"Error processing IoC {ioc}: {e}")
