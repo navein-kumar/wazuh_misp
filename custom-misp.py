@@ -16,7 +16,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 LOG_IOCS_FILE = "/var/ossec/logs/misp-iocs.log"
 LOG_ALERTS_FILE = "/var/ossec/logs/misp-alerts.log"
 LOG_INTEGRATION_FILE = "/var/ossec/logs/misp-integration.log"
-MISP_BASE_URL = "https://cti.codesec.in/attributes/restSearch/"
+MISP_BASE_URL = "https://cti.website.in/attributes/restSearch/"
 MISP_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 MISP_SSL_VERIFY = False
 SOCKET_PATH = f"{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}" + "/queue/sockets/queue"
